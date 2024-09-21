@@ -43,6 +43,7 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
 fi
 
 echo "Adding the Image in outdir"
+cp ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ${OUTDIR}
 
 echo "Creating the staging directory for the root filesystem"
 cd "$OUTDIR"
@@ -85,7 +86,7 @@ LIBS=$(${CROSS_COMPILE}readelf -a ${OUTDIR}/rootfs/bin/busybox | grep "Shared li
 for LIB in ${LIBS}; do
     LIB_PATH=$(find ${SYSROOT} -name "$LIB")
     
-    if [ -n "$LIB_PATH" ];
+    if [ -n "$LIB_PATH" ]
     then
         cp $LIB_PATH ${OUTDIR}/rootfs/lib64/
         cp $LIB_PATH ${OUTDIR}/rootfs/lib/
