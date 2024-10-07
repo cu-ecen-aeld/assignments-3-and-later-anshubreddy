@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <syslog.h>
@@ -14,7 +15,7 @@
 #define BACKLOG 10
 #define FILE_PATH "/var/tmp/aesdsocketdata"
 
-int sockfd = -1, new_fd = -1;
+int sockfd = -1, new_fd = -1, run = 1;
 FILE *file;
 
 // Signal handler for SIGINT and SIGTERM
@@ -23,8 +24,13 @@ void handle_signal(int signal)
     if (signal == SIGINT || signal == SIGTERM)
     {
         syslog(LOG_INFO, "Caught signal, exiting");
+	run = 0;
     
-        if (file) 
+        if (remove(FILE_PATH) != 0)
+	{
+            syslog(LOG_ERR, "Failed to remove file");
+	}
+
         {
             fclose(file);
         }
@@ -39,7 +45,6 @@ void handle_signal(int signal)
             close(sockfd);
         }
 
-        remove(FILE_PATH);
         closelog();
 	exit(0);
     }
@@ -139,7 +144,7 @@ int main(int argc, char *argv[])
 	return -1;
     }
 
-    while(1)
+    while(run)
     {
         sin_size = sizeof(struct sockaddr_in);
 
@@ -168,7 +173,7 @@ int main(int argc, char *argv[])
             buffer[numbytes] = '\0';
 
 	    // Append received data to the file
-            fprintf(file, "%s", buffer);
+            fputs(buffer, file);
 	    fflush(file);
 
 	    // Check for newline character to determine end of packet
