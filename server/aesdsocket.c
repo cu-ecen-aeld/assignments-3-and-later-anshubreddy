@@ -13,9 +13,17 @@
 #include <pthread.h>
 #include <time.h>
 
+// Define USE_AESD_CHAR_DEVICE build switch (set to 1 by default)
+#define USE_AESD_CHAR_DEVICE 1
+
+#if USE_AESD_CHAR_DEVICE
+    #define FILE_PATH "/dev/aesdchar"
+#else
+    #define FILE_PATH "/var/tmp/aesdsocketdata"
+#endif
+
 #define PORT 9000
 #define BACKLOG 10
-#define FILE_PATH "/var/tmp/aesdsocketdata"
 
 int sockfd = -1, run = 1;
 FILE *file;
@@ -149,6 +157,7 @@ void join_and_remove_threads()
     pthread_mutex_unlock(&thread_list_mutex);
 }
 
+#if !USE_AESD_CHAR_DEVICE
 // Thread function to append timestamp to the file every 10 seconds
 void *timestamp_thread(void *arg)
 {
@@ -157,7 +166,7 @@ void *timestamp_thread(void *arg)
         sleep(10);
 	pthread_mutex_lock(&file_mutex);
 	FILE *local_file = fopen(FILE_PATH, "a+");
-	
+
 	if (local_file)
 	{
             time_t now = time(NULL);
@@ -166,7 +175,7 @@ void *timestamp_thread(void *arg)
             strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
             fputs(timestamp, local_file);
             fflush(local_file);
-            fclose(local_file);	    
+            fclose(local_file);
 	}
 
 	pthread_mutex_unlock(&file_mutex);
@@ -174,8 +183,9 @@ void *timestamp_thread(void *arg)
 
     return NULL;
 }
+#endif
 
-int main(int argc, char *argv[]) 
+int main(int argc, char *argv[])
 {
     struct sockaddr_in server_addr, client_addr;
     socklen_t sin_size;
@@ -190,17 +200,17 @@ int main(int argc, char *argv[])
     signal(SIGTERM, handle_signal);
 
     // Check for the -d argument to run as a daemon
-    if (argc == 2 && strcmp(argv[1], "-d") == 0) 
+    if (argc == 2 && strcmp(argv[1], "-d") == 0)
     {
         pid_t pid = fork();
 
-        if (pid < 0) 
+        if (pid < 0)
 	{
             syslog(LOG_ERR, "Fork failed");
             return -1;
         }
 
-        if (pid > 0) 
+        if (pid > 0)
 	{
             exit(EXIT_SUCCESS); // Parent process exits
         }
@@ -269,12 +279,14 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    # if !USE_AESD_CHAR_DEVICE
     // Create a thread to append timestamp to the file every 10 seconds
     if (pthread_create(&ts_thread, NULL, timestamp_thread, NULL) != 0)
     {
         syslog(LOG_ERR, "Timestamp thread creation failed");
 	return -1;
     }
+    #endif
 
     while (run) 
     {
@@ -307,8 +319,10 @@ int main(int argc, char *argv[])
     // Join and remove any remaining threads before exiting
     join_and_remove_threads();
 
+    #if !USE_AESD_CHAR_DEVICE
     // Join the timestamp thread before exiting
     pthread_join(ts_thread, NULL);
-   
+    #endif
+
     return 0;
 }
