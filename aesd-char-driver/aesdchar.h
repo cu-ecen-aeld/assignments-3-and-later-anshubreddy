@@ -29,7 +29,7 @@ struct aesd_dev
     struct cdev cdev;     /* Char device structure      */
     struct aesd_circular_buffer circular_buffer; /* Circular buffer */
     struct mutex lock;   /* Mutex to protect access to circular buffer */
-    struct aesd_buffer_entry tmp_entry; /* Temporary buffer entry for incomplete writes */
+    struct aesd_buffer_entry entry; /* Buffer entry */
 };
 
 
