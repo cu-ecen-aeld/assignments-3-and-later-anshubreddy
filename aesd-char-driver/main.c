@@ -35,7 +35,7 @@ int aesd_open(struct inode *inode, struct file *filp)
 {
     PDEBUG("open");
 
-    // Retrieve the device structure from the inode structure and assign it 
+    // Retrieve the device structure from the inode structure and assign it
     filp->private_data = container_of(inode->i_cdev, struct aesd_dev, cdev);
     return 0;
 }
@@ -71,6 +71,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
         return -EINVAL;
     }
 
+    // Lock the device to ensure synchronized access
     retval = mutex_lock_interruptible(&dev->lock);
     if (retval != 0)
     {
@@ -81,6 +82,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     size_t entry_offset = 0;
     size_t bytes_remaining = 0;
 
+    // Find the entry corresponding to the current file position
     struct aesd_buffer_entry *entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->circular_buffer, *f_pos, &entry_offset);
     if (!entry)
     {
@@ -91,11 +93,13 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 
     bytes_remaining = entry->size - entry_offset;
 
+    // Ensure we do not read more than the requested number of bytes
     if (bytes_remaining > count)
     {
         bytes_remaining = count;
     }
 
+    // Copy data from the kernel buffer to the user buffer
     retval = copy_to_user(buf, entry->buffptr + entry_offset, bytes_remaining);
 
     if (retval != 0)
@@ -106,10 +110,12 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
         goto unlock;
     }
 
+    // Update file position and return number of bytes read
     *f_pos += bytes_remaining;
     retval = bytes_remaining;
 
 unlock:
+    // Unlock the device
     mutex_unlock(&dev->lock);
     PDEBUG("Mutex unlocked");
     return retval;
@@ -121,7 +127,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 {
     ssize_t retval = -ENOMEM;
     char *kern_buff = NULL;
-    const char *newline_ptr = NULL;
+    const char *new_ptr = NULL;
     size_t size_until_newline = 0;
     struct aesd_dev *dev = NULL;
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
@@ -140,7 +146,6 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         return -EINVAL;
     }
 
-
     // Allocate kernel buffer to store data from user space
     kern_buff = kmalloc(count, GFP_KERNEL);
     if (!kern_buff)
@@ -155,11 +160,12 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     {
         PDEBUG("Unable to copy data from user space");
         retval = -EFAULT; // Return error if copy_from_user fails
-        goto free_mem_exit;
+        goto free_kern;
     }
 
-    newline_ptr = memchr(kern_buff, '\n', count);
-    size_until_newline = newline_ptr ? newline_ptr - kern_buff + 1 : 0;
+    // Find the newline character in the buffer
+    new_ptr = memchr(kern_buff, '\n', count);
+    size_until_newline = new_ptr ? new_ptr - kern_buff + 1 : 0;
 
     // Lock the device mutex
     retval = mutex_lock_interruptible(&dev->lock);
@@ -167,9 +173,10 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     {
         retval = -ERESTARTSYS;
         PDEBUG("Unable to lock device mutex");
-        goto free_mem_exit;
+        goto free_kern;
     }
 
+    // If a newline is found, add the entry to the circular buffer
     if (size_until_newline > 0)
     {
         dev->entry.buffptr = krealloc(dev->entry.buffptr, dev->entry.size + size_until_newline, GFP_KERNEL);
@@ -177,36 +184,50 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         {
             PDEBUG("Reallocation failed");
             retval = -ENOMEM;
-            goto free_unlock_exit;
+            goto free_unlock;
         }
 
+        // Copy data to the buffer entry
         memcpy(dev->entry.buffptr + dev->entry.size, kern_buff, size_until_newline);
         dev->entry.size += size_until_newline;
 
-        aesd_circular_buffer_add_entry(&dev->circular_buffer, &dev->entry);
+        PDEBUG("Adding entry to buffer: size_until_newline = %zu", size_until_newline);
+        const char *rtrn = aesd_circular_buffer_add_entry(&dev->circular_buffer, &dev->entry);
 
+        // Free old entry if overwritten
+        if (rtrn)
+        {
+            kfree(rtrn);
+        }
+
+        // Reset the entry
         dev->entry.size = 0;
         dev->entry.buffptr = NULL;
     }
     else
     {
+        // If no newline, append the data to the current buffer entry
         dev->entry.buffptr = krealloc(dev->entry.buffptr, dev->entry.size + count, GFP_KERNEL);
         if (!dev->entry.buffptr)
         {
             PDEBUG("Reallocation failed");
             retval = -ENOMEM;
-            goto free_unlock_exit;
+            goto free_unlock;
         }
 
+        // Copy data to the buffer entry
         memcpy(dev->entry.buffptr + dev->entry.size, kern_buff, count);
         dev->entry.size += count;
     }
 
+    PDEBUG("Updated entry: size = %zu", dev->entry.size);
     retval = count;
 
-free_unlock_exit:
+free_unlock:
+    // Unlock the device mutex
     mutex_unlock(&dev->lock);
-free_mem_exit:
+free_kern:
+    // Free the kernel buffer
     kfree(kern_buff);
     return retval; // Return number of bytes written
 }
@@ -253,7 +274,8 @@ int aesd_init_module(void)
         return result;
     }
 
-    memset(&aesd_device,0,sizeof(struct aesd_dev)); // Initialize device structure
+    // Initialize device structure
+    memset(&aesd_device,0,sizeof(struct aesd_dev));
 
     // Initialize mutex and circular buffer
     aesd_circular_buffer_init(&aesd_device.circular_buffer);
