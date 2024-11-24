@@ -11,19 +11,15 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <time.h>
 
-// Define USE_AESD_CHAR_DEVICE build switch (set to 1 by default)
-#define USE_AESD_CHAR_DEVICE 1
+#define PORT 9000
+#define BACKLOG 10
 
-#if USE_AESD_CHAR_DEVICE
+#ifdef USE_AESD_CHAR_DEVICE
     #define FILE_PATH "/dev/aesdchar"
 #else
     #define FILE_PATH "/var/tmp/aesdsocketdata"
 #endif
-
-#define PORT 9000
-#define BACKLOG 10
 
 int sockfd = -1, run = 1;
 FILE *file;
@@ -31,7 +27,7 @@ pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Define the thread_node_t structure
-typedef struct thread_node 
+typedef struct thread_node
 {
     pthread_t thread;
     struct thread_node *next;
@@ -40,17 +36,19 @@ typedef struct thread_node
 thread_node_t *thread_list = NULL;
 
 // Signal handler for SIGINT and SIGTERM
-void handle_signal(int signal) 
+void handle_signal(int signal)
 {
-    if (signal == SIGINT || signal == SIGTERM) 
+    if (signal == SIGINT || signal == SIGTERM)
     {
         syslog(LOG_INFO, "Caught signal, exiting");
         run = 0;
 
-        if (remove(FILE_PATH) != 0) 
+#ifndef USE_AESD_CHAR_DEVICE
+        if (remove(FILE_PATH) != 0)
 	{
             syslog(LOG_ERR, "Failed to remove file");
         }
+#endif
 
 	if (file != NULL)
 	{
@@ -157,7 +155,7 @@ void join_and_remove_threads()
     pthread_mutex_unlock(&thread_list_mutex);
 }
 
-#if !USE_AESD_CHAR_DEVICE
+#ifndef USE_AESD_CHAR_DEVICE
 // Thread function to append timestamp to the file every 10 seconds
 void *timestamp_thread(void *arg)
 {
@@ -279,16 +277,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    # if !USE_AESD_CHAR_DEVICE
-    // Create a thread to append timestamp to the file every 10 seconds
-    if (pthread_create(&ts_thread, NULL, timestamp_thread, NULL) != 0)
-    {
-        syslog(LOG_ERR, "Timestamp thread creation failed");
-	return -1;
-    }
-    #endif
-
-    while (run) 
+    while (run)
     {
         sin_size = sizeof(struct sockaddr_in);
         new_fd = malloc(sizeof(int));
@@ -306,8 +295,8 @@ int main(int argc, char *argv[])
             syslog(LOG_ERR, "Thread creation failed");
             close(*new_fd);
             free(new_fd);
-        } 
-	else 
+        }
+	else
 	{
             add_thread_to_list(thread);
         }
@@ -318,11 +307,6 @@ int main(int argc, char *argv[])
 
     // Join and remove any remaining threads before exiting
     join_and_remove_threads();
-
-    #if !USE_AESD_CHAR_DEVICE
-    // Join the timestamp thread before exiting
-    pthread_join(ts_thread, NULL);
-    #endif
 
     return 0;
 }
