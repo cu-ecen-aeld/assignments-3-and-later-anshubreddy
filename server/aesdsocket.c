@@ -11,9 +11,12 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #define PORT 9000
 #define BACKLOG 10
+#define USE_AESD_CHAR_DEVICE 1
 
 #ifdef USE_AESD_CHAR_DEVICE
     #define FILE_PATH "/dev/aesdchar"
@@ -66,51 +69,131 @@ void handle_signal(int signal)
     }
 }
 
+int handle_ioctl_command(char *buffer, int fd) {
+    unsigned int write_cmd, write_cmd_offset;
+    if (sscanf(buffer, "AESDCHAR_IOCSEEKTO:%u,%u", &write_cmd, &write_cmd_offset) == 2) 
+    {
+        struct aesd_seekto seekto;
+        seekto.write_cmd = write_cmd;
+        seekto.write_cmd_offset = write_cmd_offset;
+
+        // Debug print
+        syslog(LOG_DEBUG, "Performing ioctl with write_cmd: %u, write_cmd_offset: %u", write_cmd, write_cmd_offset);
+
+        if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) == -1) 
+        {
+            syslog(LOG_ERR, "ioctl failed for write_cmd: %u, write_cmd_offset: %u", write_cmd, write_cmd_offset);
+            return -1;
+        }
+
+        // Confirm the ioctl operation
+        syslog(LOG_DEBUG, "ioctl operation completed successfully for write_cmd: %u, write_cmd_offset: %u", write_cmd, write_cmd_offset);
+        return 0;
+    }
+
+    syslog(LOG_ERR, "Failed to parse ioctl command: %s", buffer);
+    return -1;
+}
+
 // Thread function to handle each connection
-void *handle_connection(void *arg) 
+void *handle_connection(void *arg)
 {
     int new_fd = *(int *)arg;
     free(arg);
     char buffer[1024];
     int numbytes;
-
     syslog(LOG_INFO, "Accepted connection");
 
-    // Lock the mutex before accessing the file
-    pthread_mutex_lock(&file_mutex);
+#ifdef USE_AESD_CHAR_DEVICE
+    int device_fd = open(FILE_PATH, O_RDWR);
+    if (device_fd == -1)
+    {
+        syslog(LOG_ERR, "Failed to open aesdchar device");
+        close(new_fd);
+        return NULL;
+    }
+#else
     FILE *local_file = fopen(FILE_PATH, "a+");
-
-    if (!local_file) 
+    if (!local_file)
     {
         syslog(LOG_ERR, "File opening failed");
         close(new_fd);
-        pthread_mutex_unlock(&file_mutex);
         return NULL;
     }
+#endif
 
-    // Receive data from the client and write to the file
-    while ((numbytes = recv(new_fd, buffer, sizeof(buffer) - 1, 0)) > 0) 
+    // Receive data from the client and handle the command
+    while ((numbytes = recv(new_fd, buffer, sizeof(buffer) - 1, 0)) > 0)
     {
         buffer[numbytes] = '\0';
-        fputs(buffer, local_file);
-        fflush(local_file);
 
-        if (strchr(buffer, '\n')) 
-	{
-            // Send the full content of the file back to the client
-            fseek(local_file, 0, SEEK_SET);
+        // Debug print
+        syslog(LOG_DEBUG, "Received data: %s", buffer);
 
-            while ((numbytes = fread(buffer, 1, sizeof(buffer) - 1, local_file)) > 0) 
-	    {
-                buffer[numbytes] = '\0';
-                send(new_fd, buffer, numbytes, 0);
+        // Check for AESDCHAR_IOCSEEKTO command
+        syslog(LOG_DEBUG, "Checking for AESDCHAR_IOCSEEKTO command...");
+        if (strncmp(buffer, "AESDCHAR_IOCSEEKTO:", 19) == 0)
+        {
+#ifdef USE_AESD_CHAR_DEVICE
+            syslog(LOG_DEBUG, "Detected AESDCHAR_IOCSEEKTO command");
+            if (handle_ioctl_command(buffer, device_fd) == 0) {
+                syslog(LOG_INFO, "ioctl command handled successfully");
+
+		// Read from the device after seeking
+		off_t current_offset = lseek(device_fd, 0, SEEK_CUR); // Ensure the correct offset
+                syslog(LOG_DEBUG, "Current file offset after ioctl: %ld", current_offset);
+
+                while ((numbytes = read(device_fd, buffer, sizeof(buffer) - 1)) > 0)
+                {
+                    buffer[numbytes] = '\0';
+                    syslog(LOG_DEBUG, "Read %d bytes after seeking: %s", numbytes, buffer);
+                    send(new_fd, buffer, numbytes, 0);
+                }
+
+                if (numbytes == -1)
+                {
+                    syslog(LOG_ERR, "Error reading from device after seeking");
+                }
             }
+            else
+            {
+                syslog(LOG_ERR, "ioctl command handling failed");
+            }
+#else
+        syslog(LOG_DEBUG, "Ignoring AESDCHAR_IOCSEEKTO command in non-device mode");
+#endif
+        }
+        else
+        {
+#ifdef USE_AESD_CHAR_DEVICE
+            // Write to the aesdchar device
+            if (write(device_fd, buffer, numbytes) == -1)
+            {
+                syslog(LOG_ERR, "Write to aesdchar device failed");
+            }
+#else
+            fputs(buffer, local_file);
+            fflush(local_file);
+            if (strchr(buffer, '\n'))
+            {
+                // Send the full content of the file back to the client
+                fseek(local_file, 0, SEEK_SET);
+                while ((numbytes = fread(buffer, 1, sizeof(buffer) - 1, local_file)) > 0)
+                {
+                    buffer[numbytes] = '\0';
+                    send(new_fd, buffer, numbytes, 0);
+                }
+            }
+#endif
         }
     }
 
-    // Close the file and unlock the mutex
+    // Close the file/device and unlock the mutex
+#ifdef USE_AESD_CHAR_DEVICE
+    close(device_fd);
+#else
     fclose(local_file);
-    pthread_mutex_unlock(&file_mutex);
+#endif
     close(new_fd);
     syslog(LOG_INFO, "Closed connection");
     return NULL;
@@ -119,18 +202,18 @@ void *handle_connection(void *arg)
 // Function to add a thread to the linked list
 void add_thread_to_list(pthread_t thread) 
 {
-    pthread_mutex_lock(&thread_list_mutex);
+    // pthread_mutex_lock(&thread_list_mutex);
     thread_node_t *new_node = (thread_node_t *)malloc(sizeof(thread_node_t));
     new_node->thread = thread;
     new_node->next = thread_list;
     thread_list = new_node;
-    pthread_mutex_unlock(&thread_list_mutex);
+    // pthread_mutex_unlock(&thread_list_mutex);
 }
 
 // Function to join and remove completed threads from the linked list
 void join_and_remove_threads() 
 {
-    pthread_mutex_lock(&thread_list_mutex);
+    // pthread_mutex_lock(&thread_list_mutex);
     thread_node_t *current = thread_list;
     thread_node_t *prev = NULL;
 
@@ -152,7 +235,7 @@ void join_and_remove_threads()
         free(temp);
     }
 
-    pthread_mutex_unlock(&thread_list_mutex);
+    // pthread_mutex_unlock(&thread_list_mutex);
 }
 
 #ifndef USE_AESD_CHAR_DEVICE
@@ -192,6 +275,13 @@ int main(int argc, char *argv[])
 
     // Open log for syslogging
     openlog("aesdsocket", LOG_PID, LOG_USER);
+    syslog(LOG_INFO, "Starting aesdsocket server...");
+
+#ifdef USE_AESD_CHAR_DEVICE
+    syslog(LOG_INFO, "USE_AESD_CHAR_DEVICE is enabled");
+#else
+    syslog(LOG_INFO, "USE_AESD_CHAR_DEVICE is not enabled");
+#endif
 
     // Set up signal handlers
     signal(SIGINT, handle_signal);
@@ -277,6 +367,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+
     while (run)
     {
         sin_size = sizeof(struct sockaddr_in);
@@ -288,6 +379,8 @@ int main(int argc, char *argv[])
             free(new_fd);
             continue;
         }
+
+        syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(client_addr.sin_addr));
 
         // Create a new thread to handle the connection
         if (pthread_create(&thread, NULL, handle_connection, new_fd) != 0) 
@@ -308,5 +401,16 @@ int main(int argc, char *argv[])
     // Join and remove any remaining threads before exiting
     join_and_remove_threads();
 
+#ifndef USE_AESD_CHAR_DEVICE
+    pthread_cancel(ts_thread);
+#endif
+
+    if (sockfd != -1)
+    {
+        close(sockfd);
+    }
+
+    syslog(LOG_INFO, "aesdsocket server is shutting down");
+    closelog();
     return 0;
 }
