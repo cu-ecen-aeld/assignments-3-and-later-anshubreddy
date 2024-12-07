@@ -239,14 +239,13 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
     struct aesd_dev *dev = filp->private_data;
     loff_t newpos;
     int total_size = 0;
-    long lock_val;
 
     // Determine the new file position based on the whence parameter
     switch(whence)
     {
         // Set the file position to the specified offset
         case SEEK_SET:
-            newpos = filp->f_pos;
+            newpos = off;
             break;
 
         // Set the file position relative to the current position
@@ -289,7 +288,6 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
     PDEBUG("Sought file position to %d", newpos);
     mutex_unlock(&dev->lock);
 
-quit:
     return newpos;
 }
 
