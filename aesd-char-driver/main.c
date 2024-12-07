@@ -245,7 +245,7 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
     {
         // Set the file position to the specified offset
         case SEEK_SET:
-            newpos = off;
+            newpos = filp->f_pos;
             break;
 
         // Set the file position relative to the current position
