@@ -243,23 +243,24 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
     // Determine the new file position based on the whence parameter
     switch(whence)
     {
+        // Set the file position to the specified offset
         case SEEK_SET:
-            // Set the file position to the specified offset
             newpos = filp->f_pos;
             break;
 
+        // Set the file position relative to the current position
         case SEEK_CUR:
-            // Set the file position relative to the current position
             newpos = filp->f_pos + off;
             break;
 
+        // Set the file position relative to the end of the file
         case SEEK_END:
-            // Set the file position relative to the end of the file
             newpos = mutex_lock_interruptible(&dev->lock);
             if (newpos != 0)
             {
+                newpos = -ERESTARTSYS;
                 PDEBUG("Error: Unable to do mutex lock");
-                return -ERESTARTSYS;
+                goto quit;
             }
 
             // Calculate the total length
@@ -274,19 +275,22 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
 
         default:
             // Invalid whence parameter, hence, return an error
-            return -EINVAL;
+            newpos = -EINVAL;
+            goto quit;
     }
 
     // Ensure the new file position is within valid bounds
     if (newpos < 0)
     {
-        return -EINVAL;
+        newpos = -EINVAL;
+        goto quit;
     }
 
     // Update the file position
     filp->f_pos = newpos;
-    PDEBUG("Sought file position to %d", filp->f_pos);
+    PDEBUG("Sought file position to %d", newpos);
 
+quit:
     return newpos;
 }
 
@@ -303,29 +307,35 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     // Check if the command is AESDCHAR_IOCSEEKTO
     if (cmd != AESDCHAR_IOCSEEKTO)
     {
-        return -ENOTTY; // Not a valid IOCTL command for this driver
+        PDEBUG("Invalid inputs for aesd_unlocked_ioctl\n");
+        ret = -ENOTTY; // Not a valid IOCTL command for this driver
+        goto quit;
     }
 
     // Copy the seekto structure from user space
     if (copy_from_user(&seekto, (struct aesd_seekto __user *) arg, sizeof(seekto)));
     {
         PDEBUG("Failed to copy from user space\n");
-        return -EFAULT; // Return error if copy from user space fails
+        ret = -EFAULT; // Return error if copy from user space fails
+        goto quit;
     }
 
     // Validate the write_cmd value
-    if (seekto.write_cmd > AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED)
+    if (seekto.write_cmd > AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED || seekto.write_cmd < 0)
     {
-        PDEBUG("Error: Invalid command index");
-        return -EINVAL; // Return error if write_cmd is invalid
+        PDEBUG("Error: Invalid command index %u", seekto.write_cmd);
+        ret = -EINVAL; // Return error if write_cmd is invalid
+        goto quit;
     }
 
     seekto.write_cmd = (seekto.write_cmd + dev->circular_buffer.out_offs) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
-    PDEBUG("Write cmd is %d, write cmd offset is %d\n", seekto.write_cmd, seekto.write_cmd_offset);
+    PDEBUG("Write cmd is %u, write cmd offset is %u", seekto.write_cmd, seekto.write_cmd_offset);
+
     if (seekto.write_cmd_offset > dev->circular_buffer.entry[seekto.write_cmd].size)
     {
-        PDEBUG("Error: Invalid command offset");
-        return -EINVAL; // Return error if write_cmd is invalid
+        PDEBUG("Error: Invalid command offset %u for entry size %zu", seekto.write_cmd_offset, dev->circular_buffer.entry[seekto.write_cmd].size);
+        ret = -EINVAL; // Return error if write_cmd offset is invalid
+        goto quit;
     }
 
     // Lock the mutex to ensure synchronized access to the device
@@ -333,27 +343,23 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     if (ret != 0)
     {
         PDEBUG("Unable to lock mutex");
-        return -ERESTARTSYS; // Return error if locking fails
+        ret = -ERESTARTSYS; // Return error if locking fails
+        goto quit;
     }
 
     // Calculate the new file position based on the write_cmd and write_cmd_offset
     for (int i = dev->circular_buffer.out_offs; i != seekto.write_cmd;)
     {
-        if (dev->circular_buffer.entry[i].size == 0)
-        {
-            ret = -EINVAL; // Return error if the entry size is invalid
-            goto unlock;
-        }
-
         total_size += dev->circular_buffer.entry[i].size; // Add the size of the entry to newpos
         i = (i + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
     }
 
     filp->f_pos = total_size + seekto.write_cmd_offset; // Update the file position
-
-unlock:
-    // Unlock the mutex
     mutex_unlock(&dev->lock);
+    PDEBUG("Total size is %d", total_size);
+    PDEBUG("Updated file position to %lld", filp->f_pos);
+
+quit:
     return ret;
 }
 
