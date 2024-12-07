@@ -239,6 +239,7 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
     struct aesd_dev *dev = filp->private_data;
     loff_t newpos;
     int total_size = 0;
+    long lock_val;
 
     // Determine the new file position based on the whence parameter
     switch(whence)
@@ -255,12 +256,10 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
 
         // Set the file position relative to the end of the file
         case SEEK_END:
-            newpos = mutex_lock_interruptible(&dev->lock);
-            if (newpos != 0)
+            if (mutex_lock_interruptible(&dev->lock) != 0)
             {
-                newpos = -ERESTARTSYS;
                 PDEBUG("Error: Unable to do mutex lock");
-                goto quit;
+                return -ERESTARTSYS;
             }
 
             // Calculate the total length
@@ -275,15 +274,13 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
 
         default:
             // Invalid whence parameter, hence, return an error
-            newpos = -EINVAL;
-            goto quit;
+            return -EINVAL;
     }
 
     // Ensure the new file position is within valid bounds
     if (newpos < 0)
     {
-        newpos = -EINVAL;
-        goto quit;
+        return -EINVAL;
     }
 
     // Update the file position
