@@ -323,17 +323,17 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     }
 
     // Validate the write_cmd value
-    if (seekto.write_cmd > AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED || seekto.write_cmd < 0)
+    if (seekto.write_cmd >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED || seekto.write_cmd < 0)
     {
         PDEBUG("Error: Invalid command index %u", seekto.write_cmd);
         ret = -EINVAL; // Return error if write_cmd is invalid
         goto quit;
     }
 
-    seekto.write_cmd = (seekto.write_cmd + dev->circular_buffer.out_offs) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    // seekto.write_cmd = (seekto.write_cmd + dev->circular_buffer.out_offs) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
     PDEBUG("Write cmd is %u, write cmd offset is %u", seekto.write_cmd, seekto.write_cmd_offset);
 
-    if (seekto.write_cmd_offset > dev->circular_buffer.entry[seekto.write_cmd].size)
+    if (seekto.write_cmd_offset >= dev->circular_buffer.entry[seekto.write_cmd].size)
     {
         PDEBUG("Error: Invalid command offset %u for entry size %zu", seekto.write_cmd_offset, dev->circular_buffer.entry[seekto.write_cmd].size);
         ret = -EINVAL; // Return error if write_cmd offset is invalid
@@ -343,7 +343,7 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     // Lock the mutex to ensure synchronized access to the device
     ret = mutex_lock_interruptible(&dev->lock);
     if (ret != 0)
-    {
+    
         PDEBUG("Unable to lock mutex");
         ret = -ERESTARTSYS; // Return error if locking fails
         goto quit;
