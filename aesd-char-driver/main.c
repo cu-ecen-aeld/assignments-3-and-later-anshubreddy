@@ -269,8 +269,8 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
                 total_size += dev->circular_buffer.entry[i].size;
                 i = (i + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
             }
-            mutex_unlock(&dev->lock);
             newpos = total_size - 1 + off;
+            mutex_unlock(&dev->lock);
             break;
 
         default:
@@ -287,8 +287,10 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
     }
 
     // Update the file position
+    mutex_lock(&dev->lock);
     filp->f_pos = newpos;
     PDEBUG("Sought file position to %d", newpos);
+    mutex_unlock(&dev->lock);
 
 quit:
     return newpos;
@@ -313,7 +315,7 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     }
 
     // Copy the seekto structure from user space
-    if (copy_from_user(&seekto, (struct aesd_seekto __user *) arg, sizeof(seekto)));
+    if (copy_from_user(&seekto, (struct aesd_seekto __user *) arg, sizeof(seekto)))
     {
         PDEBUG("Failed to copy from user space\n");
         ret = -EFAULT; // Return error if copy from user space fails
