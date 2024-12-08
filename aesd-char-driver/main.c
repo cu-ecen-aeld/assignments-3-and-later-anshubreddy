@@ -317,7 +317,7 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         ret = -EFAULT; // Return error if copy from user space fails
         goto quit;
     }
-    
+
     // Lock the mutex to ensure synchronized access
     ret = mutex_lock_interruptible(&dev->lock);
     if (ret != 0)
@@ -335,7 +335,7 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         goto quit;
     }
 
-    // seekto.write_cmd = (seekto.write_cmd + dev->circular_buffer.out_offs) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    seekto.write_cmd = (seekto.write_cmd + dev->circular_buffer.out_offs) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
     PDEBUG("Write cmd is %u, write cmd offset is %u", seekto.write_cmd, seekto.write_cmd_offset);
 
     if (seekto.write_cmd_offset >= dev->circular_buffer.entry[seekto.write_cmd].size)

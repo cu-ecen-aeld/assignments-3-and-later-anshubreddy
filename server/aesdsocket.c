@@ -1,10 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/queue.h>
 #include <sys/stat.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <syslog.h>
@@ -12,8 +15,11 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include "../aesd-char-driver/aesd_ioctl.h"
+
+#pragma GCC diagnostic warning "-Wunused-variable"
 
 #define PORT 9000
 #define BACKLOG 10
@@ -25,19 +31,30 @@
     #define FILE_PATH "/var/tmp/aesdsocketdata"
 #endif
 
-int sockfd = -1, run = 1;
-FILE *file;
+#define BUFFER_LEN 1024
+// int sock_fd = -1, run 1;
+FILE *file = NULL;
+bool exit_loop = false;
+
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Define the thread_node_t structure
+typedef struct
+{
+    int new_fd;
+    int device_fd;
+    struct sockaddr_storage sock_addr;
+} ThreadArgs;
+
+// Define the thread_node structure
 typedef struct thread_node
 {
     pthread_t thread;
-    struct thread_node *next;
-} thread_node_t;
+    SLIST_ENTRY(thread_node) entry;
+} thread_node;
 
-thread_node_t *thread_list = NULL;
+// Set head of list
+SLIST_HEAD(ThreadList, thread_node) head = SLIST_HEAD_INITIALIZER(head);
 
 // Signal handler for SIGINT and SIGTERM
 void handle_signal(int signal)
@@ -45,6 +62,9 @@ void handle_signal(int signal)
     if (signal == SIGINT || signal == SIGTERM)
     {
         syslog(LOG_INFO, "Caught signal, exiting");
+    }
+
+/*
         run = 0;
 
 #ifndef USE_AESD_CHAR_DEVICE
@@ -68,126 +88,231 @@ void handle_signal(int signal)
         closelog();
         exit(0);
     }
+*/
+
+    exit_loop = true;
+}
+
+void initialize_sigaction()
+{
+    struct sigaction sighandle;
+    // Initialize sigaction
+    sighandle.sa_handler = handle_signal;
+    sigemptyset(&sighandle.sa_mask); // Initialize the signal set to empty
+    sighandle.sa_flags = 0;          // No special flags
+
+    // Catch SIGINT
+    if (sigaction(SIGINT, &sighandle, NULL) == -1)
+    {
+        syslog(LOG_ERR, "Error setting up signal handler SIGINT: %s \n", strerror(errno));
+    }
+
+    // Catch SIGTERM
+    if (sigaction(SIGTERM, &sighandle, NULL) == -1)
+    {
+        syslog(LOG_ERR, "Error setting up signal handler SIGINT: %s \n", strerror(errno));
+    }
+}
+
+int receive_store_socket_data(int new_fd, int device_fd)
+{
+    char *buffer = NULL;
+    size_t total_received = 0;
+    size_t current_size = BUFFER_LEN;
+    size_t mult_factor = 1;
+    struct aesd_seekto seekto;
+
+    buffer = (char *) calloc(current_size, sizeof(char));
+    if (buffer == NULL)
+    {
+        syslog(LOG_ERR, "Failed to allocate client buffer");
+        return -1;
+    }
+
+    while (true)
+    {
+        ssize_t numbytes = recv(new_fd, buffer + total_received, current_size - total_received - 1, 0);
+        if (numbytes <= 0)
+        {
+            break;
+        }
+
+        total_received += numbytes;
+        buffer[total_received] = '\0';
+
+        if (strchr(buffer, '\n') != NULL)
+        {
+            break;
+        }
+
+        mult_factor <<= 1;
+        size_t rev_size = mult_factor * BUFFER_LEN;
+        char *rev_buffer = (char *) realloc(buffer, rev_size);
+        if (rev_buffer == NULL)
+        {
+            syslog(LOG_ERR, "Reallocation of client buffer failed, returning with error");
+            free(buffer);
+            return -1;
+        }
+
+        buffer = rev_buffer;
+        current_size = rev_size;
+    }
+
+    // Check if the buffer contains an ioctl command
+    if (strncmp(buffer, "AESDCHAR_IOCSEEKTO:", 19) == 0)
+    {
+        // Extract command and offset from the received data
+        if (sscanf(buffer + 19, "%u,%u", &seekto.write_cmd, &seekto.write_cmd_offset) == 2)
+        {
+            syslog(LOG_INFO, "Parsed ioctl command AESDCHAR_IOCSEEKTO with command %u, offset %u", seekto.write_cmd, seekto.write_cmd_offset);
+
+            // Perform the ioctl operation
+            if (ioctl(device_fd, AESDCHAR_IOCSEEKTO, &seekto) == -1)
+            {
+                syslog(LOG_ERR, "ioctl AESDCHAR_IOCSEEKTO failed: %s", strerror(errno));
+                free(buffer);
+                return -1;
+            }
+            syslog(LOG_INFO, "Seek operation successful");
+
+            // Since this was an ioctl command, skip writing to the file
+            free(buffer);
+            return 0;
+        }
+        else
+        {
+            syslog(LOG_ERR, "Failed to parse AESDCHAR_IOCSEEKTO command and offset");
+        }
+    }
+    // Now we have the complete data, store it in the file
+    syslog(LOG_INFO, "Writing received data to the sockedata file");
+    // Lock the mutex before writing to the file
+    pthread_mutex_lock(&file_mutex);
+    if (write(device_fd, buffer, total_received) != -1)
+    {
+        syslog(LOG_INFO, "Syncing data to the disk");
+        fdatasync(device_fd);
+    }
+    else
+    {
+        syslog(LOG_ERR, "Writing received data to the socketdata file failed");
+        pthread_mutex_unlock(&file_mutex); //Unlock mutex before returning from function
+        free(buffer);
+        return -1;
+    }
+    // UnLock the mutex after writing to the file
+    pthread_mutex_unlock(&file_mutex);
+    syslog(LOG_INFO, "Unlocked mutex and returning from write");
+    free(buffer);
+    return 0; // Return success
+}
+
+int return_data_to_client(int new_fd, int device_fd)
+{
+    char *send_buff;
+    size_t loaded_bytes;
+    lseek(device_fd, 0, SEEK_SET);
+    send_buff = (char *) malloc(BUFFER_LEN);
+    if (send_buff == NULL)
+    {
+        syslog(LOG_INFO, "Failure to allocate buffer");
+        return -1;
+    }
+
+    pthread_mutex_lock(&file_mutex);
+    while ((loaded_bytes = read(device_fd, send_buff, sizeof(send_buff) - 1)) > 0)
+    {
+        send_buff[loaded_bytes] = '\0';
+
+        if (send(new_fd, send_buff, loaded_bytes, 0) == -1)
+        {
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&file_mutex);
+    free(send_buff);
+    return 0;
 }
 
 // Thread function to handle each connection
 void *handle_connection(void *arg)
 {
-    int new_fd = *(int *)arg;
-    free(arg);
-    char buffer[1024];
-    int numbytes;
+    ThreadArgs *threadArg = (ThreadArgs *)arg;
+    char client_ip[INET_ADDRSTRLEN];
 
-    syslog(LOG_INFO, "Accepted connection");
-
-    // Lock the mutex before accessing the file
-    pthread_mutex_lock(&file_mutex);
-    FILE *local_file = fopen(FILE_PATH, "a+");
-
-    if (!local_file)
+    if (threadArg->sock_addr.ss_family == AF_INET)
     {
-        syslog(LOG_ERR, "File opening failed");
-        close(new_fd);
-        pthread_mutex_unlock(&file_mutex);
-        return NULL;
+        struct sockaddr_in *addr_in = (struct sockaddr_in *)&threadArg->sock_addr;
+        inet_ntop(AF_INET, &(addr_in->sin_addr), client_ip, sizeof(client_ip));
+    }
+    else if (threadArg->sock_addr.ss_family == AF_INET6)
+    {
+        struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *) &threadArg->sock_addr;
+        inet_ntop(AF_INET6, &(addr_in6->sin6_addr), client_ip, sizeof(client_ip));
     }
 
-    int fd = fileno(local_file);
+    syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-    // Receive data from the client and write to the file
-    while ((numbytes = recv(new_fd, buffer, sizeof(buffer) - 1, 0)) > 0) 
+    if (receive_store_socket_data(threadArg->new_fd, threadArg->device_fd) == 0)
     {
-        buffer[numbytes] = '\0';
-        if (strncmp(buffer, "AESDCHAR_IOCSEEKTO:", 19) == 0)
-        {
-            unsigned int write_cmd, write_cmd_offset;
-            if (sscanf(buffer + 19, "%u,%u", &write_cmd, &write_cmd_offset) == 2)
-            {
-                struct aesd_seekto seekto;
-                seekto.write_cmd = write_cmd;
-                seekto.write_cmd_offset = write_cmd_offset;
-
-                if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) == -1)
-                {
-                    syslog(LOG_ERR, "ioctl failed");
-                }
-
-                fseek(local_file, 0, SEEK_SET);
-                while ((numbytes = fread(buffer, 1, sizeof(buffer) - 1, local_file)) > 0)
-                {
-                    buffer[numbytes] = '\0';
-                    send(new_fd, buffer, numbytes, 0);
-                }
-
-                fclose(local_file);
-                local_file = fopen(FILE_PATH, "a+");
-                fd = fileno(local_file);
-            }
-        }
-        else
-        {
-            fputs(buffer, local_file);
-            fflush(local_file);
-
-            if (strchr(buffer, '\n')) 
-	    {
-                // Send the full content of the file back to the client
-                fseek(local_file, 0, SEEK_SET);
-
-                while ((numbytes = fread(buffer, 1, sizeof(buffer) - 1, local_file)) > 0) 
-	        {
-                    buffer[numbytes] = '\0';
-                    send(new_fd, buffer, numbytes, 0);
-                }
-            }
-        }
+        return_data_to_client(threadArg->new_fd, threadArg->device_fd);
     }
 
-    // Close the file and unlock the mutex
-    fclose(local_file);
-    pthread_mutex_unlock(&file_mutex);
-    close(new_fd);
-    syslog(LOG_INFO, "Closed connection");
-    return NULL;
+    if (close(threadArg->new_fd) == 0)
+    {
+        syslog(LOG_INFO, "Closed connection");
+    }
+    else
+    {
+	syslog(LOG_ERR, "Failed to close connection");
+    }
 }
 
 // Function to add a thread to the linked list
-void add_thread_to_list(pthread_t thread) 
+void add_thread_to_list(pthread_t thread)
 {
-    // pthread_mutex_lock(&thread_list_mutex)
-    thread_node_t *new_node = (thread_node_t *)malloc(sizeof(thread_node_t));
+    thread_node *new_node = (thread_node *)malloc(sizeof(thread_node));
+
+    if (!new_node)
+    {
+        syslog(LOG_ERR, "Failed to allocate memory for thread node");
+        return;
+    }
+
     new_node->thread = thread;
-    new_node->next = thread_list;
-    thread_list = new_node;
-    // pthread_mutex_unlock(&thread_list_mutex)
+    pthread_mutex_lock(&thread_list_mutex);
+    syslog(LOG_INFO, "Inserting thread node");
+    SLIST_INSERT_HEAD(&head, new_node, entry);
+    pthread_mutex_unlock(&thread_list_mutex);
 }
 
 // Function to join and remove completed threads from the linked list
-void join_and_remove_threads() 
+void join_and_remove_threads()
 {
-    // pthread_mutex_lock(&thread_list_mutex);
-    thread_node_t *current = thread_list;
-    thread_node_t *prev = NULL;
+    thread_node *current = SLIST_FIRST(&head);
+    thread_node *next;
+    pthread_mutex_lock(&thread_list_mutex);
 
-    while (current != NULL) 
+    while (current != NULL)
     {
-        pthread_join(current->thread, NULL);
-
-        if (prev == NULL) 
-	{
-            thread_list = current->next;
-        } 
-	else 
-	{
-            prev->next = current->next;
+        next = SLIST_NEXT(current, entry);
+        if (pthread_join(current->thread, NULL))
+        {
+            syslog(LOG_INFO, "Removing the thread node");
+            SLIST_REMOVE(&head, current, thread_node, entry);
+            free(current);
+        }
+        else
+        {
+            syslog(LOG_INFO, "Thread %ld unable to join: %s", current->thread, strerror(errno));
         }
 
-        thread_node_t *temp = current;
-        current = current->next;
-        free(temp);
+        current = next;
     }
 
-    // pthread_mutex_unlock(&thread_list_mutex);
+    pthread_mutex_unlock(&thread_list_mutex);
 }
 
 #ifndef USE_AESD_CHAR_DEVICE
@@ -220,13 +345,17 @@ void *timestamp_thread(void *arg)
 
 int main(int argc, char *argv[])
 {
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t sin_size;
-    pthread_t thread, ts_thread;
-    int *new_fd;
+    struct addrinfo inputs, *server_info;
+    int sock_fd, new_fd;
+    struct sockaddr_storage client_addr;
+    socklen_t client_size;
+    int device_fd = -1;
+    int status;
+    int yes = 1;
 
-    // Open log for syslogging
-    openlog("aesdsocket", LOG_PID, LOG_USER);
+
+    // Open a system logger connection for aesdsocket utility
+    openlog("aesdsocket", LOG_CONS | LOG_PID | LOG_PERROR, LOG_USER);
     syslog(LOG_INFO, "Starting aesdsocket server...");
 
 #ifdef USE_AESD_CHAR_DEVICE
@@ -235,9 +364,46 @@ int main(int argc, char *argv[])
     syslog(LOG_INFO, "USE_AESD_CHAR_DEVICE is not enabled");
 #endif
 
-    // Set up signal handlers
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
+    /*Line  was partly referred from https://beej.us/guide/bgnet/html/#socket */
+    memset(&inputs, 0, sizeof(inputs));
+    inputs.ai_family = AF_UNSPEC;     // IPv4 or IPv6
+    inputs.ai_socktype = SOCK_STREAM; // TCP stream sockets
+    inputs.ai_flags = AI_PASSIVE;     // fill in my IP for me
+
+    // Get address info
+    if ((status = getaddrinfo(NULL, "9000", &inputs, &server_info)) != 0)
+    {
+        syslog(LOG_ERR, "Error occurred while getting the address info: %s \n", gai_strerror(status));
+        closelog();
+        exit(1);
+    }
+
+    // Open a stream socket
+    sock_fd = socket(server_info->ai_family, server_info->ai_socktype, server_info->ai_protocol);
+    if (sock_fd == -1)
+    {
+        syslog(LOG_ERR, "Error occurred while creating a socket: %s\n", strerror(errno));
+        freeaddrinfo(server_info);
+        closelog();
+        exit(1);
+    }
+
+    // Set socket options
+    if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1)
+    {
+        syslog(LOG_ERR, "Error occurred while setting a socket option: %s \n", strerror(errno));
+        freeaddrinfo(server_info);
+        closelog();
+        exit(1);
+    }
+
+    if (bind(sock_fd, server_info->ai_addr, server_info->ai_addrlen) == -1)
+    {
+        syslog(LOG_ERR, "Error occurred while binding a socket: %s \n", strerror(errno));
+        freeaddrinfo(server_info);
+        closelog();
+        exit(1);
+    }
 
     // Check for the -d argument to run as a daemon
     if (argc == 2 && strcmp(argv[1], "-d") == 0)
@@ -291,78 +457,78 @@ int main(int argc, char *argv[])
         open("/dev/null", O_RDWR);   // stderr
     }
 
-    // Create a socket
-    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) 
+    if (listen(sock_fd, 20) == -1)
     {
-        syslog(LOG_ERR, "Socket creation failed");
-        return -1;
+        syslog(LOG_ERR, "Error occurred during listen operation: %s \n", strerror(errno));
+        freeaddrinfo(server_info);
+        closelog();
+        exit(1);
     }
 
-    // Configure server address structure
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    memset(&(server_addr.sin_zero), '\0', 8);
+    initialize_sigaction();
+    client_size = sizeof(client_addr);
 
-    // Bind the socket to the port
-    if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(struct sockaddr)) == -1) 
+    // Main server loop
+    while (!exit_loop)
     {
-        syslog(LOG_ERR, "Binding failed");
-        close(sockfd);
-        return -1;
-    }
-
-    // Listen for incoming connections
-    if (listen(sockfd, BACKLOG) == -1) 
-    {
-        syslog(LOG_ERR, "Listening failed");
-        return -1;
-    }
-
-
-    while (run)
-    {
-        sin_size = sizeof(struct sockaddr_in);
-        new_fd = malloc(sizeof(int));
-
-        if ((*new_fd = accept(sockfd, (struct sockaddr *)&client_addr, &sin_size)) == -1) 
-	{
-            syslog(LOG_ERR, "Accepting connection failed");
-            free(new_fd);
+        new_fd = accept(sock_fd, (struct sockaddr *)&client_addr, &client_size);
+        if (new_fd == -1)
+        {
+            syslog(LOG_ERR, "Error occurred during accept operation: %s \n", strerror(errno));
             continue;
         }
 
-        syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(client_addr.sin_addr));
-
-        // Create a new thread to handle the connection
-        if (pthread_create(&thread, NULL, handle_connection, new_fd) != 0) 
-	{
-            syslog(LOG_ERR, "Thread creation failed");
-            close(*new_fd);
-            free(new_fd);
-        }
-	else
-	{
-            add_thread_to_list(thread);
+        pthread_t thread;
+        ThreadArgs *arg = malloc(sizeof(ThreadArgs));
+        if (arg == NULL)
+        {
+            syslog(LOG_ERR, "Failed to allocate memory for thread arguments");
+            close(new_fd);
+            continue;
         }
 
-	// Join and remove completed threads
-	join_and_remove_threads();
-    }
+        arg->new_fd = new_fd;
+        arg->sock_addr = client_addr;
 
-    // Join and remove any remaining threads before exiting
-    join_and_remove_threads();
-
-#ifndef USE_AESD_CHAR_DEVICE
-    pthread_cancel(ts_thread);
+#ifdef USE_AESD_CHAR_DEVICE
+        // Open file descriptor for /dev/aesdchar only when a client connects
+        arg->device_fd = open(FILE_PATH, O_RDWR);
+        if (arg->device_fd == -1)
+        {
+            syslog(LOG_ERR, "Failed to open %s", FILE_PATH);
+            close(new_fd);
+            free(arg);
+            continue;
+        }
+#else
+        // Use already opened file descriptor
+        arg->device_fd = device_fd;
 #endif
 
-    if (sockfd != -1)
-    {
-        close(sockfd);
+        syslog(LOG_INFO, "Creating a new thread");
+        int err = pthread_create(&thread, NULL, handle_connection, (void *)arg);
+        if (err != 0)
+        {
+            syslog(LOG_ERR, "Error creating thread: %s", strerror(err));
+            close(new_fd);
+            free(arg);
+            continue;
+        }
+
+        add_thread_to_list(thread);
+        join_and_remove_threads();
     }
 
-    syslog(LOG_INFO, "aesdsocket server is shutting down");
+    // Clean up before exiting
+    syslog(LOG_ERR, "Waiting for active threads to join");
+    join_and_remove_threads();
+
+    close(device_fd);
+    // Remove the temporary file if it exists
+    unlink(FILE_PATH);
+
+    syslog(LOG_INFO, "Deleted the temporary socket data file before exiting.");
+    freeaddrinfo(server_info);
     closelog();
     return 0;
 }
