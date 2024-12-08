@@ -239,15 +239,6 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
     struct aesd_dev *dev = filp->private_data;
     loff_t newpos;
     int total_size = 0;
-    long lock_val = 0;
-
-    lock_val = mutex_lock_interruptible(&dev->lock);
-
-    if (lock_val != 0)
-    {
-        PDEBUG("Error: Unable to do mutex lock");
-	return -ERESTARTSYS;
-    }
 
     // Determine the new file position based on the whence parameter
     switch(whence)
@@ -264,31 +255,41 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
 
         // Set the file position relative to the end of the file
         case SEEK_END:
+            newpos = mutex_lock_interruptible(&dev->lock);
+            if (newpos != 0)
+            {
+                newpos = -ERESTARTSYS;
+                PDEBUG("Unable to lock mutex");
+                goto quit;
+            }
             // Calculate the total length
             for (int i = dev->circular_buffer.out_offs; i != dev->circular_buffer.in_offs; )
             {
                 total_size += dev->circular_buffer.entry[i].size;
                 i = (i + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
             }
+            mutex_unlock(&dev->lock);
             newpos = total_size - 1 + off;
             break;
 
         default:
             // Invalid whence parameter, hence, return an error
-            return -EINVAL;
+            newpos = -EINVAL;
+            goto quit;
     }
 
     // Ensure the new file position is within valid bounds
     if (newpos < 0)
     {
-        return -EINVAL;
+        newpos = -EINVAL;
+        goto quit;
     }
 
     // Update the file position
     filp->f_pos = newpos;
     PDEBUG("Sought file position to %d", newpos);
-    mutex_unlock(&dev->lock);
 
+quit:
     return newpos;
 }
 
@@ -318,17 +319,8 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         goto quit;
     }
 
-    // Lock the mutex to ensure synchronized access
-    ret = mutex_lock_interruptible(&dev->lock);
-    if (ret != 0)
-    {
-        PDEBUG("Error: Unable to lock mutex");
-	ret = -ERESTARTSYS; // Return error if locking fails
-	goto quit;
-    }
-
     // Validate the write_cmd value
-    if (seekto.write_cmd >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED || seekto.write_cmd < 0)
+    if (seekto.write_cmd > AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED)
     {
         PDEBUG("Error: Invalid command index %u", seekto.write_cmd);
         ret = -EINVAL; // Return error if write_cmd is invalid
@@ -338,12 +330,22 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     seekto.write_cmd = (seekto.write_cmd + dev->circular_buffer.out_offs) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
     PDEBUG("Write cmd is %u, write cmd offset is %u", seekto.write_cmd, seekto.write_cmd_offset);
 
-    if (seekto.write_cmd_offset >= dev->circular_buffer.entry[seekto.write_cmd].size)
+    if (seekto.write_cmd_offset > dev->circular_buffer.entry[seekto.write_cmd].size)
     {
         PDEBUG("Error: Invalid command offset %u for entry size %zu", seekto.write_cmd_offset, dev->circular_buffer.entry[seekto.write_cmd].size);
         ret = -EINVAL; // Return error if write_cmd offset is invalid
         goto quit;
     }
+
+    // Lock the mutex to ensure synchronized access
+    ret = mutex_lock_interruptible(&dev->lock);
+    if (ret != 0)
+    {
+        PDEBUG("Error: Unable to lock mutex");
+	ret = -ERESTARTSYS; // Return error if locking fails
+	goto quit;
+    }
+
 
     // Calculate the new file position based on the write_cmd and write_cmd_offset
     for (int i = dev->circular_buffer.out_offs; i != seekto.write_cmd;)
